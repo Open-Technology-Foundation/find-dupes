@@ -97,6 +97,6 @@ sudo make uninstall
 
 ## License
 
-MIT
+GPL-3.0
 
 #fin
