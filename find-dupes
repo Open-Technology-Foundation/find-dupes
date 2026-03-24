@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+# Find and optionally delete duplicate files based on content hash
+
+set -euo pipefail
+shopt -s inherit_errexit
+
+declare -r VERSION=1.1.0
+#shellcheck disable=SC2155
+declare -r SCRIPT_PATH=$(realpath -- "$0")
+#shellcheck disable=SC2034
+declare -r SCRIPT_DIR=${SCRIPT_PATH%/*} SCRIPT_NAME=${SCRIPT_PATH##*/}
+
+# Terminal colors
+if [[ -t 1 && -t 2 ]]; then
+  declare -r RED=$'\033[0;31m' GREEN=$'\033[0;32m' YELLOW=$'\033[0;33m' CYAN=$'\033[0;36m' BOLD=$'\033[1m' NC=$'\033[0m'
+else
+  declare -r RED='' GREEN='' YELLOW='' CYAN='' BOLD='' NC=''
+fi
+
+# Configuration (frozen after argument parsing)
+declare -i VERBOSE=1 DELETE_MODE=0 FORCE=0
+declare -- EXTENSIONS='.txt,.md'
+declare -- SCAN_DIR=''
+
+# Runtime state
+declare -A SIZE_MAP=() HASH_MAP=()
+declare -a EXT_PREDICATES=()
+declare -i FILE_COUNT=0 DUPE_GROUP_COUNT=0
+
+# --- Messaging functions ---------------------------------------------------
+
+_msg() {
+  local -- prefix=$1; shift
+  printf '%b\n' "$prefix$*${NC}" >&2
+}
+
+info() {
+  ((VERBOSE)) || return 0
+  _msg '' "$@"
+}
+
+warn() {
+  _msg "${YELLOW}Warning: " "$@"
+}
+
+error() {
+  _msg "${RED}Error: " "$@"
+}
+
+die() {
+  local -i code=$1; shift
+  (($#)) && error "$@" ||:
+  exit "$code"
+}
+
+# --- Documentation ---------------------------------------------------------
+
+show_help() {
+  cat <<HELP
+${BOLD}$SCRIPT_NAME${NC} — Find and optionally delete duplicate files based on content.
+
+${BOLD}Usage:${NC}
+  $SCRIPT_NAME [OPTIONS] DIRECTORY
+
+${BOLD}Options:${NC}
+  -e, --extensions EXT  Comma-separated extensions (default: .txt,.md)
+                        Use "*" for all files
+  -d, --delete          Delete duplicate files (keeps oldest)
+  -f, --force           Delete without confirmation prompt
+  -v, --verbose         Verbose output (default)
+  -q, --quiet           Suppress informational output
+  -V, --version         Print version and exit
+  -h, --help            Print this help and exit
+
+${BOLD}Examples:${NC}
+  $SCRIPT_NAME /path/to/dir                  Check .txt and .md files
+  $SCRIPT_NAME /path/to/dir -e ".jpg,.png"   Check image files
+  $SCRIPT_NAME /path/to/dir -e "*"           Check all files
+  $SCRIPT_NAME /path/to/dir -d               Delete duplicates with prompt
+  $SCRIPT_NAME /path/to/dir -df              Delete without asking
+HELP
+}
+
+# --- Utility functions -----------------------------------------------------
+
+noarg() {
+  (($# > 1)) || die 22 "Option ${1@Q} requires an argument"
+}
+
+# Prompt for yes/no confirmation. Returns 0 for yes, 1 for no.
+yn() {
+  local -- prompt=${1:-'Continue?'} reply
+  printf '%s [y/N] ' "$prompt" >&2
+  read -r reply
+  [[ ${reply,,} == 'y' ]]
+}
+
+# --- Validation functions --------------------------------------------------
+
+_validate_directory() {
+  local -- dir=$1
+  [[ -d "$dir" ]] || die 3 "Directory ${dir@Q} does not exist"
+  [[ -r "$dir" ]] || die 13 "Directory ${dir@Q} is not readable"
+}
+
+_parse_extensions() {
+  local -- ext_str=$1
+  EXT_PREDICATES=()
+
+  # Wildcard — match all files
+  if [[ $ext_str == '*' ]]; then
+    return 0
+  fi
+
+  # Build find predicates from comma-separated extensions
+  local -- ext
+  local -i first=1
+  while IFS= read -r -d ',' ext || [[ -n "$ext" ]]; do
+    ext=${ext##[[:space:]]}
+    ext=${ext%%[[:space:]]}
+    [[ -n "$ext" ]] || continue
+    # Ensure extension starts with a dot
+    [[ $ext == .* ]] || ext=".$ext"
+    if ((first)); then
+      EXT_PREDICATES+=(-name "*$ext")
+      first=0
+    else
+      EXT_PREDICATES+=(-o -name "*$ext")
+    fi
+  done <<< "$ext_str"
+
+  ((${#EXT_PREDICATES[@]})) || die 22 'No valid extensions provided'
+}
+
+# --- Business logic --------------------------------------------------------
+
+_build_find_cmd() {
+  FIND_CMD=(find "$SCAN_DIR" -type f)
+  if ((${#EXT_PREDICATES[@]})); then
+    FIND_CMD+=('(' "${EXT_PREDICATES[@]}" ')')
+  fi
+}
+
+_collect_sizes() {
+  SIZE_MAP=()
+  FILE_COUNT=0
+  local -- filepath size
+  while IFS= read -r filepath; do
+    [[ -n "$filepath" ]] || continue
+    size=$(stat --format='%s' -- "$filepath" 2>/dev/null) || continue
+    if [[ -v SIZE_MAP["$size"] ]]; then
+      SIZE_MAP["$size"]+=$'\n'"$filepath"
+    else
+      SIZE_MAP["$size"]=$filepath
+    fi
+    FILE_COUNT+=1
+  done < <("${FIND_CMD[@]}" 2>/dev/null)
+}
+
+_hash_candidates() {
+  HASH_MAP=()
+  local -- size line hash filepath
+  local -a candidate_files=()
+
+  # Only hash files whose size appears more than once
+  for size in "${!SIZE_MAP[@]}"; do
+    [[ "${SIZE_MAP[$size]}" == *$'\n'* ]] || continue
+    readarray -t candidate_files <<< "${SIZE_MAP[$size]}"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      # sha256sum escapes filenames with \, newline, CR by prefixing line with '\'
+      if [[ $line == \\* ]]; then
+        line=${line:1}
+        hash=${line:0:64}
+        filepath=${line:66}
+        # Unescape \\→\ and \n→newline in filepath
+        filepath=${filepath//\\\\/\\}
+      else
+        hash=${line:0:64}
+        filepath=${line:66}
+      fi
+      if [[ -v HASH_MAP["$hash"] ]]; then
+        HASH_MAP["$hash"]+=$'\n'"$filepath"
+      else
+        HASH_MAP["$hash"]=$filepath
+      fi
+    done < <(sha256sum -- "${candidate_files[@]}" 2>/dev/null ||:)
+  done
+}
+
+_dedup_inodes() {
+  local -- hash
+  for hash in "${!HASH_MAP[@]}"; do
+    [[ "${HASH_MAP[$hash]}" == *$'\n'* ]] || continue
+    local -a files=() unique_files=()
+    local -A seen_inodes=()
+    readarray -t files <<< "${HASH_MAP[$hash]}"
+    local -- f inode
+    for f in "${files[@]}"; do
+      inode=$(stat --format='%d:%i' -- "$f" 2>/dev/null) || continue
+      if [[ -v seen_inodes["$inode"] ]]; then
+        continue
+      fi
+      seen_inodes["$inode"]=1
+      unique_files+=("$f")
+    done
+    # Rebuild entry with unique-inode files only
+    if ((${#unique_files[@]} < 2)); then
+      unset 'HASH_MAP[$hash]'
+    else
+      local -- joined=${unique_files[0]}
+      local -i j
+      for ((j=1; j<${#unique_files[@]}; j+=1)); do
+        joined+=$'\n'"${unique_files[$j]}"
+      done
+      HASH_MAP["$hash"]=$joined
+    fi
+  done
+}
+
+_format_mtime() {
+  printf '%(%Y-%m-%d %H:%M:%S)T' "$1"
+}
+
+_process_group() {
+  local -- hash=$1
+  local -a files=() mtimes=()
+  readarray -t files <<< "${HASH_MAP[$hash]}"
+
+  # Collect mtimes once (used for both display and deletion)
+  local -i i mtime
+  for i in "${!files[@]}"; do
+    mtime=$(stat --format='%Y' -- "${files[$i]}" 2>/dev/null) || mtime=0
+    mtimes+=("$mtime")
+  done
+
+  # Display the group
+  printf '\n%bDuplicate group (hash: %.8s...): %b\n' "$CYAN" "$hash" "$NC"
+  for i in "${!files[@]}"; do
+    printf '  - %s (modified: %s)\n' "${files[$i]}" "$(_format_mtime "${mtimes[$i]}")"
+  done
+
+  ((DELETE_MODE)) || return 0
+
+  # Find oldest file (lowest mtime)
+  local -i oldest_idx=0 oldest_mtime=${mtimes[0]}
+  for i in "${!mtimes[@]}"; do
+    if ((mtimes[i] < oldest_mtime)); then
+      oldest_mtime=${mtimes[$i]}
+      oldest_idx=$i
+    fi
+  done
+
+  printf '\n%bKeeping oldest:%b %s\n' "$GREEN" "$NC" "${files[$oldest_idx]}"
+  echo 'Files to delete:'
+  local -a to_delete=()
+  for i in "${!files[@]}"; do
+    ((i == oldest_idx)) && continue ||:
+    to_delete+=("${files[$i]}")
+    printf '  - %s\n' "${files[$i]}"
+  done
+
+  # Prompt unless --force
+  if ! ((FORCE)); then
+    yn 'Delete these files?' || { info 'Deletion cancelled.'; return 0; }
+  fi
+
+  local -- filepath
+  for filepath in "${to_delete[@]}"; do
+    if rm -- "$filepath" 2>/dev/null; then
+      printf '%bDeleted:%b %s\n' "$GREEN" "$NC" "$filepath"
+    else
+      error "Failed to delete ${filepath@Q}"
+    fi
+  done
+}
+
+# --- Main ------------------------------------------------------------------
+
+main() {
+  # Parse arguments
+  while (($#)); do case $1 in
+    -e|--extensions) noarg "$@"; shift; EXTENSIONS=$1 ;;
+    -d|--delete)     DELETE_MODE=1 ;;
+    -f|--force)      FORCE=1 ;;
+    -v|--verbose)    VERBOSE=1 ;;
+    -q|--quiet)      VERBOSE=0 ;;
+    -V|--version)    echo "$SCRIPT_NAME $VERSION"; exit 0 ;;
+    -h|--help)       show_help; exit 0 ;;
+    --)              shift; SCAN_DIR=${1:-}; break ;;
+    -[edfvqVh]?*)    set -- "${1:0:2}" "-${1:2}" "${@:2}"; continue ;;
+    -*)              die 22 "Invalid option ${1@Q}" ;;
+    *)               SCAN_DIR=$1 ;;
+  esac; shift; done
+
+  # Validate required argument
+  [[ -n "$SCAN_DIR" ]] || die 2 "Usage: $SCRIPT_NAME [OPTIONS] DIRECTORY"
+
+  # Freeze configuration
+  readonly VERBOSE DELETE_MODE FORCE EXTENSIONS SCAN_DIR
+
+  _validate_directory "$SCAN_DIR"
+  _parse_extensions "$EXTENSIONS"
+
+  # Display scan info
+  local -- ext_display
+  if [[ $EXTENSIONS == '*' ]]; then
+    ext_display='all files'
+  else
+    ext_display="files with extensions: $EXTENSIONS"
+  fi
+  info "Scanning for duplicates in $SCAN_DIR"
+  info "Checking $ext_display..."
+
+  # Phase 1: group files by size
+  declare -a FIND_CMD=()
+  _build_find_cmd
+  _collect_sizes
+
+  if ((FILE_COUNT == 0)); then
+    info 'No files found matching the specified extensions.'
+    return 0
+  fi
+
+  # Phase 2: hash only files with shared sizes
+  _hash_candidates
+
+  # Phase 3: remove hard-link false positives
+  _dedup_inodes
+
+  # Report duplicate groups
+  DUPE_GROUP_COUNT=0
+  local -- hash
+  for hash in "${!HASH_MAP[@]}"; do
+    [[ "${HASH_MAP[$hash]}" == *$'\n'* ]] || continue
+    DUPE_GROUP_COUNT+=1
+    _process_group "$hash"
+  done
+
+  if ((DUPE_GROUP_COUNT == 0)); then
+    info 'No duplicate files found.'
+  else
+    info "Found $DUPE_GROUP_COUNT group(s) of duplicate files."
+  fi
+
+  return 0
+}
+
+main "$@"
+
+#fin

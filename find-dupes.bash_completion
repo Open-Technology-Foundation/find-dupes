@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Bash completion for find-dupes
+
+_find_dupes_completion() {
+  local -- cur prev opts
+  COMPREPLY=()
+  cur=${COMP_WORDS[COMP_CWORD]}
+  prev=${COMP_WORDS[COMP_CWORD-1]}
+
+  opts="-e --extensions -d --delete -f --force -v --verbose -q --quiet -V --version -h --help"
+
+  case $prev in
+    -e|--extensions)
+      COMPREPLY=( $(compgen -W '.txt,.md .jpg,.png,.gif .pdf .py,.js,.html .csv,.json "*"' -- "$cur") )
+      return 0
+      ;;
+  esac
+
+  if [[ $cur == -* ]]; then
+    COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    return 0
+  fi
+
+  # Default to directory completion
+  COMPREPLY=( $(compgen -d -- "$cur") )
+  return 0
+}
+
+complete -F _find_dupes_completion find-dupes
+
+#fin

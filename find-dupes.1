@@ -1,0 +1,133 @@
+.\" find-dupes - Find and optionally delete duplicate files
+.\" Man page for find-dupes
+.TH FIND-DUPES 1 "March 2026" "find-dupes 1.1.0" "User Commands"
+.SH NAME
+find-dupes \- find and optionally delete duplicate files based on content hash
+.SH SYNOPSIS
+.B find-dupes
+[\fIOPTIONS\fR] \fIDIRECTORY\fR
+.SH DESCRIPTION
+.B find-dupes
+recursively scans a directory for duplicate files by comparing SHA-256
+content hashes. Files with identical content are grouped and reported
+with their modification timestamps.
+.PP
+To avoid unnecessary work, the scan uses a three-phase pipeline:
+.IP 1. 4
+Files are grouped by size. Files with a unique size cannot be
+duplicates and are skipped entirely.
+.IP 2. 4
+Only files sharing a size are hashed with \fBsha256sum\fR(1).
+Files with identical hashes are grouped as duplicates.
+.IP 3. 4
+Hard links (same device and inode) within a group are collapsed,
+preventing false positives.
+.PP
+When deleting, the oldest file (by modification time) in each
+duplicate group is preserved and all others are removed.
+.SH OPTIONS
+.TP
+.BR \-e ", " \-\-extensions " " \fIEXT\fR
+Comma-separated list of file extensions to check (default: \fB.txt,.md\fR).
+Extensions may be specified with or without a leading dot.
+Use \fB"*"\fR to match all files regardless of extension.
+.TP
+.BR \-d ", " \-\-delete
+Delete duplicate files, keeping the oldest in each group.
+Without \fB\-f\fR, prompts for confirmation before each group.
+.TP
+.BR \-f ", " \-\-force
+Skip confirmation prompts when deleting. Implies unattended operation.
+Must be combined with \fB\-d\fR to have any effect.
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output (default).
+.TP
+.BR \-q ", " \-\-quiet
+Suppress informational messages. Duplicate group listings and
+deletion output are still shown.
+.TP
+.BR \-V ", " \-\-version
+Print version information and exit.
+.TP
+.BR \-h ", " \-\-help
+Print help message and exit.
+.PP
+Short options can be bundled: \fB\-df\fR is equivalent to \fB\-d \-f\fR.
+.SH EXIT STATUS
+.TP
+.B 0
+Success (duplicates found or not).
+.TP
+.B 2
+Usage error (missing directory argument).
+.TP
+.B 3
+Specified directory does not exist.
+.TP
+.B 13
+Specified directory is not readable.
+.TP
+.B 22
+Invalid command-line option or argument.
+.SH EXAMPLES
+Find duplicate text and markdown files (default):
+.PP
+.RS
+.B find-dupes /path/to/dir
+.RE
+.PP
+Find duplicate images:
+.PP
+.RS
+.B find-dupes /path/to/dir -e ".jpg,.png,.gif"
+.RE
+.PP
+Scan all file types:
+.PP
+.RS
+.B find-dupes /path/to/dir -e "*"
+.RE
+.PP
+Delete duplicates with confirmation prompt:
+.PP
+.RS
+.B find-dupes /path/to/dir -d
+.RE
+.PP
+Delete duplicates without asking:
+.PP
+.RS
+.B find-dupes /path/to/dir -df
+.RE
+.PP
+Quietly check for duplicates (output only if found):
+.PP
+.RS
+.B find-dupes /path/to/dir -q
+.RE
+.SH NOTES
+Filenames containing backslash characters are handled correctly.
+The \fBsha256sum\fR(1) escape format (backslash-prefixed output lines)
+is detected and unescaped during parsing.
+.PP
+Hard links are identified by comparing device:inode pairs via
+\fBstat\fR(1). Two hard links to the same file are not reported as
+duplicates, and neither is deleted.
+.PP
+Filenames containing literal newline characters are not supported.
+.SH SEE ALSO
+.BR sha256sum (1),
+.BR fdupes (1),
+.BR rdfind (1),
+.BR stat (1),
+.BR find (1)
+.SH BUGS
+Report bugs at: https://github.com/Open-Technology-Foundation/find-dupes/issues
+.SH AUTHOR
+Open Technology Foundation
+.br
+https://github.com/Open-Technology-Foundation
+.SH COPYRIGHT
+Copyright \(co 2026 Open Technology Foundation.
+License MIT.
