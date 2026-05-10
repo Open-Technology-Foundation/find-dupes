@@ -282,13 +282,13 @@ main() {
   while (($#)); do case $1 in
     -e|--extensions) noarg "$@"; shift; EXTENSIONS=$1 ;;
     -d|--delete)     DELETE_MODE=1 ;;
-    -f|--force)      FORCE=1 ;;
+    -f|--force|-P)   FORCE=1 ;;
     -v|--verbose)    VERBOSE=1 ;;
     -q|--quiet)      VERBOSE=0 ;;
     -V|--version)    echo "$SCRIPT_NAME $VERSION"; exit 0 ;;
     -h|--help)       show_help; exit 0 ;;
     --)              shift; SCAN_DIR=${1:-}; break ;;
-    -[edfvqVh]?*)    set -- "${1:0:2}" "-${1:2}" "${@:2}"; continue ;;
+    -[edfPvqVh]?*)   set -- "${1:0:2}" "-${1:2}" "${@:2}"; continue ;;
     -*)              die 22 "Invalid option ${1@Q}" ;;
     *)               SCAN_DIR=$1 ;;
   esac; shift; done
